@@ -1,54 +1,66 @@
 import pandas as pd
-from os.path import dirname, join as path_join
+from os.path import join
 from dagster import InputContext, OutputContext
 from dagster._core.storage.db_io_manager import DbTypeHandler, TableSlice
+from pyiceberg import Table, Schema, types
+from pyarrow import csv
 from sqlalchemy import text
-from fsspec import filesystem
-from deltalake import write_deltalake
-from sqlalchemy.exc import SqlAlchemyError
+from fsspec.implementations.local import LocalFileSystem
 
-class DeltaLakeHandler(DbTypeHandler):
+class IcebergHandler(DbTypeHandler):
+    def __init__(self, fs_config=None):
+        self.fs = LocalFileSystem(**(fs_config or {}))  # 使用LocalFileSystem，您可以根据需要更改为其他类型的文件系统
+
     def handle_output(self, context: OutputContext, table_slice: TableSlice, df: pd.DataFrame, connection):
-        """
-        Using Delta Lake, write the dataframe to a local directly. (Deltas is multiple files)
-        Then, upload the local directory remotely using FSSpec and update trino.
-        """
-        local_path = path_join("target", table_slice.schema, table_slice.table)
-        fs = filesystem(**context.resource_config.get("fs_config"))
-        fs.makedirs(dirname(local_path), exist_ok=True)
-        write_deltalake(local_path, df, mode='overwrite', storage_options=context.resource_config.get("fs_config"))
+        local_path = join("target", table_slice.schema, table_slice.table)
+        self.fs.makedirs(local_path, exist_ok=True)
 
-        # remote_path = path_join("s3a://warehouse", "delta", table_slice.schema, table_slice.table)
-        # fs.put(local_path, remote_path, recursive=True)
+        # 定义Iceberg的schema
+        schema = Schema([
+            # 根据df或您的数据模型定义schema字段
+        ])
+        
+        # 使用pyiceberg创建表
+        table = Table.for_all_data(self.fs, local_path, schema=schema)
+
+        # 将DataFrame写入Iceberg表
+        with table.new_row() as row:
+            for _, record in df.iterrows():
+                row.append(*record)
 
         context.add_output_metadata({
-            "local_path": local_path,
-            remote_path: remote_path
+            "local_path": local_path
         })
 
+        # 注册表的SQL操作
         try:
             with connection as conn:
                 conn.execute(text(f"""
-                    CALL delta.system.register_table(
-                        schema_name => '{table_slice.schema}', 
-                        table_name => '{table_slice.table}', 
-                        table_location => '{remote_path}'
+                    CALL iceberg.system.register_table(
+                        schema_name => :schema_name, 
+                        table_name => :table_name, 
+                        table_location => :table_location
                     )
-                """))
+                """), {
+                    'schema_name': table_slice.schema,
+                    'table_name': table_slice.table,
+                    'table_location': local_path
+                })
                 conn.commit()
-        except SqlAlchemyError as e:
-            if "Table already exists" in str(e):
-                context.log.info(f"Table {table_slice.schema}.{table_slice.table} already exists")
-                pass
+        except Exception as e:
+            context.log.error(f"Error registering table: {e}")
 
-            
     def load_input(self, context: InputContext, table_slice: TableSlice, connection):
-        return pd.read_sql(f"SELECT * FROM {table_slice.schema}.{table_slice.table}", connection)
-    
+        # 读取Iceberg表
+        table = Table(self.fs, join("target", table_slice.schema, table_slice.table))
+        # 读取表到DataFrame
+        df = table.to_pandas()
+        return df
+
     @property
     def supported_types(self):
         return [pd.DataFrame]
-    
+
     @property
     def requires_fsspec(self):
         return True
